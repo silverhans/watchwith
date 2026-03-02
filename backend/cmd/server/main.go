@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/watchwith/watchwith/internal/handler"
 	"github.com/watchwith/watchwith/internal/room"
+	"github.com/watchwith/watchwith/internal/store"
 	"github.com/watchwith/watchwith/internal/ws"
 )
 
@@ -23,10 +24,28 @@ func main() {
 		port = "8080"
 	}
 
+	// PostgreSQL (optional — runs in-memory without it)
+	var db *store.DB
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		var err error
+		db, err = store.NewDB(dbURL)
+		if err != nil {
+			log.Printf("WARNING: Failed to connect to PostgreSQL: %v", err)
+			log.Println("Running in memory-only mode")
+		} else {
+			if err := db.RunMigrations(); err != nil {
+				log.Printf("WARNING: Migration failed: %v", err)
+			}
+			defer db.Close()
+		}
+	} else {
+		log.Println("DATABASE_URL not set — running in memory-only mode")
+	}
+
 	hub := ws.NewHub()
 	go hub.Run()
 
-	manager := room.NewManager(hub)
+	manager := room.NewManager(hub, db)
 	h := handler.New(manager, hub)
 
 	r := chi.NewRouter()

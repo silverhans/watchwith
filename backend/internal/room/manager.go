@@ -1,12 +1,15 @@
 package room
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/watchwith/watchwith/internal/store"
 	"github.com/watchwith/watchwith/internal/ws"
 )
 
@@ -19,13 +22,15 @@ type Manager struct {
 	chatHistory map[string][]ws.ChatPayload
 	mu          sync.RWMutex
 	hub         *ws.Hub
+	db          *store.DB // nil = in-memory only
 }
 
-func NewManager(hub *ws.Hub) *Manager {
+func NewManager(hub *ws.Hub, db *store.DB) *Manager {
 	m := &Manager{
 		rooms:       make(map[string]*Room),
 		chatHistory: make(map[string][]ws.ChatPayload),
 		hub:         hub,
+		db:          db,
 	}
 	m.registerHandlers()
 	return m
@@ -52,6 +57,16 @@ func (m *Manager) CreateRoom(name string) *Room {
 	slug := generateSlug()
 
 	room := NewRoom(id, slug, name, "")
+
+	// Persist to DB
+	if m.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.db.CreateRoom(ctx, id, slug, name); err != nil {
+			log.Printf("failed to persist room to DB: %v", err)
+		}
+	}
+
 	m.mu.Lock()
 	m.rooms[slug] = room
 	m.chatHistory[slug] = make([]ws.ChatPayload, 0, chatHistorySize)
@@ -63,8 +78,40 @@ func (m *Manager) CreateRoom(name string) *Room {
 
 func (m *Manager) GetRoom(slug string) *Room {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.rooms[slug]
+	room := m.rooms[slug]
+	m.mu.RUnlock()
+	if room != nil {
+		return room
+	}
+
+	// Try loading from DB
+	if m.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		row, err := m.db.GetRoomBySlug(ctx, slug)
+		if err != nil {
+			log.Printf("failed to load room from DB: %v", err)
+			return nil
+		}
+		if row == nil {
+			return nil
+		}
+
+		room = NewRoom(row.ID, row.Slug, row.Name, "")
+		if row.VideoURL != "" {
+			room.Video.URL = row.VideoURL
+		}
+
+		m.mu.Lock()
+		m.rooms[slug] = room
+		m.chatHistory[slug] = make([]ws.ChatPayload, 0, chatHistorySize)
+		m.mu.Unlock()
+
+		log.Printf("room loaded from DB: slug=%s", slug)
+		return room
+	}
+
+	return nil
 }
 
 func (m *Manager) handleJoin(hub *ws.Hub, cm ws.ClientMessage) {
@@ -141,13 +188,13 @@ func (m *Manager) handleLeave(hub *ws.Hub, cm ws.ClientMessage) {
 
 	m.broadcastPeers(slug)
 
-	// Cleanup empty rooms
+	// Cleanup empty rooms from memory (keep in DB)
 	if hub.RoomSize(slug) == 0 {
 		m.mu.Lock()
 		delete(m.rooms, slug)
 		delete(m.chatHistory, slug)
 		m.mu.Unlock()
-		log.Printf("room deleted (empty): slug=%s", slug)
+		log.Printf("room unloaded from memory: slug=%s", slug)
 	}
 }
 
@@ -196,6 +243,16 @@ func (m *Manager) handlePlayerSource(hub *ws.Hub, cm ws.ClientMessage) {
 		return
 	}
 	room.SetVideoURL(p.URL)
+
+	// Persist video URL to DB
+	if m.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := m.db.UpdateRoomVideoURL(ctx, cm.Client.RoomSlug, p.URL); err != nil {
+			log.Printf("failed to update video URL in DB: %v", err)
+		}
+	}
+
 	hub.BroadcastToRoom(cm.Client.RoomSlug, cm.Message, cm.Client.ID)
 }
 
